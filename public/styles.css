@@ -1,0 +1,210 @@
+/* fullscreen */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+
+  width: 100%;
+  height: 100%;
+
+  overflow: hidden;
+
+  background: #000;
+
+  font-family:
+    "Segoe UI",
+    Arial,
+    sans-serif;
+}
+
+.tv-panel {
+  position: relative;
+
+  width: 100vw;
+  height: 100vh;
+
+  overflow: hidden;
+
+  background: #000;
+}
+
+.media-container {
+  position: relative;
+
+  width: 100vw;
+  height: 100vh;
+
+  overflow: hidden;
+
+  background: #000;
+}
+
+/* base para vídeo e imagem */
+
+.media-player {
+  position: absolute;
+
+  inset: 0;
+
+  width: 100vw;
+  height: 100vh;
+
+  background: #000;
+}
+
+/* vídeo sempre fullscreen */
+
+#videoPlayer {
+  display: block;
+  object-fit: cover;
+  z-index: 1;
+}
+
+#imageViewer {
+  display: none;
+  object-fit: contain;
+  background: #000;
+  z-index: 2;
+}
+
+/* overlay minimal ultra clean */
+
+.overlay {
+  position: absolute;
+
+  top: 18px;
+  left: 18px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+
+  gap: 4px;
+
+  padding: 10px 14px;
+
+  border-radius: 14px;
+
+  background:
+    rgba(0,0,0,0.14);
+
+  backdrop-filter: blur(3px);
+
+  -webkit-backdrop-filter: blur(3px);
+
+  color: white;
+
+  max-width: 500px;
+
+  z-index: 10;
+}
+
+/* Painel RH */
+
+.badge {
+  display: inline-flex;
+
+  align-items: center;
+
+  padding: 4px 10px;
+
+  border-radius: 999px;
+
+  background:
+    rgba(255,255,255,0.05);
+
+  border:
+    1px solid rgba(255,255,255,0.08);
+
+  color:
+    rgba(255,255,255,0.82);
+
+  font-size: 9px;
+  font-weight: 600;
+
+  letter-spacing: 0.14em;
+
+  text-transform: uppercase;
+}
+
+/* nome da mídia */
+
+.overlay h1 {
+  font-size:
+    clamp(13px, 1vw, 17px);
+
+  font-weight: 500;
+
+  line-height: 1.2;
+
+  color:
+    rgba(255,255,255,0.92);
+
+  text-shadow:
+    0 2px 8px rgba(0,0,0,0.25);
+
+  max-width: 420px;
+
+  word-break: break-word;
+}
+
+/* status */
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  font-size: 9px;
+
+  color:
+    rgba(255,255,255,0.55);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+
+  border-radius: 50%;
+
+  background: #22c55e;
+
+  box-shadow:
+    0 0 8px rgba(34,197,94,0.45);
+}
+
+/* fade suave */
+
+.tv-panel::after {
+  content: '';
+
+  position: absolute;
+
+  inset: 0;
+
+  background:
+    linear-gradient(
+      to top,
+      rgba(0,0,0,0.12),
+      rgba(0,0,0,0.02),
+      rgba(0,0,0,0)
+    );
+
+  pointer-events: none;
+}
+
+/* responsivo */
+
+@media (max-width: 900px) {
+
+  .overlay {
+    top: 12px;
+    left: 12px;
+
+    padding: 8px 10px;
+
+    max-width: 300px;
+  }
+
+}

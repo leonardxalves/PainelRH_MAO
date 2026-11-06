@@ -1,0 +1,6 @@
+caso precise de alguma atualização no font.
+
+realizar a atualização e reiniciar o back, que está sendo executado no GitBash, dentro da pasta
+do projeto: PainelRH_MAO ou PainelRH_ITU.
+
+abrir o gitbash e executar: node server.js
