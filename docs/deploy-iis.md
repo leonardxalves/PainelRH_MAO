@@ -13,7 +13,7 @@ TV → IIS (site PainelRH_MAO, pasta public\)
 
 1. Node.js LTS no PATH.
 2. IIS com **URL Rewrite** e **ARR**.
-3. NSSM em `C:\nssm\nssm.exe`.
+3. WinSW: por padrão usa o mesmo `.exe` do serviço do Portal XML (`E:\webroot\wwwroot\portal-xml\backend\service\PceXmlPortal.exe`).
 4. Projeto **fora** de `C:\Users\...` (ex.: `C:\PainelRH_MAO`), senão o pool do IIS não lê os arquivos.
 5. Os vídeos em `C:\PainelRH_MAO\public\videos_mao` (a pasta não vai pro git).
 
@@ -23,7 +23,7 @@ PowerShell **como administrador**:
 
 ```
 cd C:\PainelRH_MAO
-powershell -ExecutionPolicy Bypass -File .\deploy\instalar.ps1 -HostName painelrh-mao.pce.br
+powershell -ExecutionPolicy Bypass -File .\deploy\instalar.ps1 -HostName painel_mao.pce.br
 ```
 
 | Parâmetro | Padrão | Uso |
@@ -31,7 +31,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\instalar.ps1 -HostName painelr
 | `-HostName` | (vazio) | Nome do site. Vazio = qualquer nome na porta (conflita com outro site na 80). |
 | `-Porta` | `80` | Porta do site no IIS. Sem DNS, use outra porta, ex.: `-Porta 8081`. |
 | `-PortaNode` | `8000` | Porta do Node. Se mudar, troque também no `public\web.config`. |
-| `-Nssm` | `C:\nssm\nssm.exe` | Caminho do NSSM. |
+| `-WinswExe` | `.exe` do Portal XML | Caminho do WinSW. |
 
 Para Itu, a mesma coisa em outra pasta com `-SiteName PainelRH_ITU -Servico PainelRH_ITU -PortaNode 8001` (e o 8001 no web.config).
 
@@ -49,7 +49,7 @@ Só vídeos/imagens? Copie para `public\videos_mao`. A TV atualiza sozinha.
 
 | Sintoma | Causa / solução |
 |---|---|
-| 502.3 em `/api` | Serviço parado: `Get-Service PainelRH_MAO`, `logs\servico.log`. |
+| 502.3 em `/api` | Serviço parado: `Get-Service PainelRH_MAO`, `logs\PainelRH_MAO.err.log` / `.out.log`. |
 | 404 em `/api` | Proxy do ARR desligado. Rode o `instalar.ps1` de novo. |
 | 401/500.19 na página | Pool sem leitura na pasta, ou projeto dentro de `C:\Users`. |
 | Vídeo novo demora a aparecer | SSE barrado: confira o `responseBufferLimit` do ARR = 0. O fallback de 30 s cobre. |
@@ -57,7 +57,7 @@ Só vídeos/imagens? Copie para `public\videos_mao`. A TV atualiza sozinha.
 ```
 Get-Service PainelRH_MAO
 Restart-Service PainelRH_MAO
-Get-Content C:\PainelRH_MAO\logs\servico.log -Tail 50
+Get-Content E:\webroot\wwwroot\PainelRH_MAO\logs\PainelRH_MAO.out.log -Tail 50
 ```
 
 Depois de migrar, o `web.config` da raiz do projeto (proxy de tudo para o 8000) não é mais usado e pode ser apagado.

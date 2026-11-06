@@ -47,5 +47,5 @@ foreach ($tentativa in 1..15) {
 if ($ok) {
   Write-Host "`nPronto. Recarregue a página na TV." -ForegroundColor Green
 } else {
-  Write-Warning "O Node não respondeu em http://127.0.0.1:$PortaNode/health. Veja $raiz\logs\servico.log."
+  Write-Warning "O Node não respondeu em http://127.0.0.1:$PortaNode/health. Veja $raiz\logs\$Servico.err.log e $Servico.out.log."
 }
