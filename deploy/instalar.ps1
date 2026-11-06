@@ -2,17 +2,17 @@
   Instalação do Painel RH (Manaus) num servidor Windows com IIS - mesmo modelo do Portal de XML.
   Rode uma vez, como administrador, na pasta do projeto:
 
-    powershell -ExecutionPolicy Bypass -File .\deploy\instalar.ps1 -HostName painelrh-mao.pce.br
+    powershell -ExecutionPolicy Bypass -File .\deploy\instalar.ps1 -HostName painel_mao.pce.br
 
   Pré-requisitos (o script confere e avisa o que faltar):
     - Node.js (LTS) no PATH
     - IIS com URL Rewrite e Application Request Routing (ARR) - os mesmos do Portal de XML
-    - NSSM em C:\nssm\nssm.exe (o mesmo do Portal de XML)
+    - WinSW (por padrão, o mesmo .exe do serviço do Portal de XML)
     - Projeto FORA da pasta do usuário (ex.: C:\PainelRH_MAO). O pool do IIS não lê C:\Users\...\Desktop.
 
   O que faz:
     1. Liga o proxy do ARR e zera o buffer de resposta (para o SSE de "mídia atualizada" chegar na hora).
-    2. Cria o serviço PainelRH_MAO (node server.js, início automático, log em logs\servico.log).
+    2. Cria o serviço PainelRH_MAO com WinSW (node server.js, início automático, logs em logs\).
     3. Cria o pool e o site no IIS apontando para a pasta public\ e dá leitura ao pool.
     4. Instala as dependências e sobe o serviço (deploy\atualizar.ps1).
 #>
@@ -22,7 +22,8 @@ param(
   [int]$PortaNode = 8000,
   [string]$SiteName = 'PainelRH_MAO',
   [string]$Servico = 'PainelRH_MAO',
-  [string]$Nssm = 'C:\nssm\nssm.exe'
+  # WinSW: reaproveita o mesmo executável do serviço do Portal de XML.
+  [string]$WinswExe = 'E:\webroot\wwwroot\portal-xml\backend\service\PceXmlPortal.exe'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,31 +59,54 @@ Passo 'Ligando o proxy do ARR'
 # responseBufferLimit é global: no Portal de XML só faz o ARR repassar a resposta sem acumular, sem efeito visível.
 & $appcmd set config -section:system.webServer/proxy /enabled:"True" /timeout:"00:10:00" /preserveHostHeader:"True" /responseBufferLimit:"0" /commit:apphost | Out-Null
 
-# --- 2. Serviço do Node -------------------------------------------------------------------------------------------
+# --- 2. Serviço do Node (WinSW, igual ao Portal de XML) -----------------------------------------------------------
 if (Get-Service -Name $Servico -ErrorAction SilentlyContinue) {
   Write-Host "Serviço $Servico já existe: mantido."
 } else {
   Passo "Criando o serviço $Servico (porta $PortaNode)"
+  if (-not (Test-Path $WinswExe)) { throw "WinSW não encontrado em $WinswExe. Informe -WinswExe <caminho do WinSW .exe>." }
   $ocupada = Get-NetTCPConnection -LocalPort $PortaNode -State Listen -ErrorAction SilentlyContinue
   if ($ocupada) {
     throw "A porta $PortaNode já está em uso (PID $($ocupada[0].OwningProcess)). Feche o node que roda no Git Bash antes de instalar o serviço."
   }
-  if (-not (Test-Path $Nssm)) { throw "NSSM não encontrado em $Nssm. Informe -Nssm <caminho do nssm.exe>." }
+
+  # O WinSW lê a configuração de um .xml com o mesmo nome do .exe, na mesma pasta.
+  $serviceDir = Join-Path $raiz 'service'
   $logs = Join-Path $raiz 'logs'
-  New-Item -ItemType Directory -Force -Path $logs | Out-Null
-  & $Nssm install $Servico $node | Out-Null
-  & $Nssm set $Servico AppParameters 'server.js' | Out-Null
-  & $Nssm set $Servico AppDirectory $raiz | Out-Null
-  # HOST=127.0.0.1: o Node só atende o IIS; a TV passa a acessar pelo site do IIS.
-  & $Nssm set $Servico AppEnvironmentExtra "PORT=$PortaNode" "HOST=127.0.0.1" | Out-Null
-  & $Nssm set $Servico DisplayName 'Painel RH - Manaus' | Out-Null
-  & $Nssm set $Servico Description "Painel de TV do RH (Manaus). O IIS repassa /api para http://127.0.0.1:$PortaNode." | Out-Null
-  & $Nssm set $Servico Start SERVICE_AUTO_START | Out-Null
-  & $Nssm set $Servico AppStdout (Join-Path $logs 'servico.log') | Out-Null
-  & $Nssm set $Servico AppStderr (Join-Path $logs 'servico.log') | Out-Null
-  & $Nssm set $Servico AppRotateFiles 1 | Out-Null
-  & $Nssm set $Servico AppRotateBytes 10485760 | Out-Null
-  & $Nssm set $Servico AppRestartDelay 5000 | Out-Null
+  New-Item -ItemType Directory -Force -Path $serviceDir, $logs | Out-Null
+  $serviceExe = Join-Path $serviceDir "$Servico.exe"
+  Copy-Item $WinswExe $serviceExe -Force
+
+  function Escape-Xml([string] $value) { [System.Security.SecurityElement]::Escape($value) }
+
+  $config = @"
+<service>
+  <id>$Servico</id>
+  <name>Painel RH - Manaus</name>
+  <description>Painel de TV do RH (Manaus). O IIS repassa /api para http://127.0.0.1:$PortaNode.</description>
+  <executable>$(Escape-Xml $node)</executable>
+  <arguments>server.js</arguments>
+  <workingdirectory>$(Escape-Xml $raiz)</workingdirectory>
+  <env name="PORT" value="$PortaNode" />
+  <env name="HOST" value="127.0.0.1" />
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <onfailure action="restart" delay="60 sec" />
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>15 sec</stoptimeout>
+  <logpath>$(Escape-Xml $logs)</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>
+"@
+  Set-Content -Path (Join-Path $serviceDir "$Servico.xml") -Value $config -Encoding UTF8
+
+  & $serviceExe install
+  if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar o serviço (código $LASTEXITCODE)." }
 }
 
 if ($PortaNode -ne 8000) {
