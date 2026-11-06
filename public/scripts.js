@@ -1,303 +1,376 @@
-const videoPlayer = document.getElementById('videoPlayer');
-const imageViewer = document.getElementById('imageViewer');
+/*
+  Painel RH - player da TV.
 
-let playlist = [];
-let currentIndex = 0;
-let imageTimeout = null;
-let playlistHash = '';
-let eventSource = null;
+  Escrito em ES5 de propósito (var, function, XMLHttpRequest, sem ?. / async / arrow):
+  navegadores de TV antigos (webOS/Tizen até ~2021) não entendem sintaxe nova e,
+  com um único erro de sintaxe, o arquivo inteiro deixa de rodar.
 
-let nextVideoPreload = null;
+  Diagnóstico na TV (sem console): abra a página com ?debug=1.
+*/
+(function () {
+  'use strict';
 
-const REFRESH_INTERVAL = 30000;
-const IMAGE_DURATION = 10000;
-const ERROR_SKIP_DELAY = 3000;
+  var videoPlayer = document.getElementById('videoPlayer');
+  var imageViewer = document.getElementById('imageViewer');
 
-async function fetchPlaylist() {
-  const response = await fetch(`/api/media?ts=${Date.now()}`, {
-    cache: 'no-store'
-  });
+  var REFRESH_INTERVAL = 30000;   // fallback da playlist se o SSE não funcionar
+  var IMAGE_DURATION = 10000;     // tempo de cada imagem
+  var ERROR_SKIP_DELAY = 3000;    // espera antes de pular uma mídia com erro
+  var WATCHDOG_INTERVAL = 5000;   // de quanto em quanto tempo confere se o vídeo andou
+  var STALL_TIMEOUT = 20000;      // vídeo parado (ou que não começou) por esse tempo = pula
 
-  if (!response.ok) {
-    throw new Error(`Erro HTTP: ${response.status}`);
+  var playlist = [];
+  var playlistHash = '';
+  var currentIndex = 0;
+  var currentSrc = '';
+  var imageTimeout = null;
+  var skipTimeout = null;
+
+  var lastVideoTime = -1;
+  var lastProgressAt = 0;
+
+  /* ------------------------------------------------------------------ debug */
+
+  var debugEnabled = /[?&]debug=1/.test(window.location.search);
+  var debugBox = null;
+  var debugLines = [];
+
+  if (debugEnabled) {
+    debugBox = document.createElement('pre');
+    debugBox.style.cssText =
+      'position:absolute;top:0;left:0;right:0;z-index:99;margin:0;padding:8px;' +
+      'max-height:45%;overflow:hidden;background:rgba(0,0,0,.75);color:#0f0;' +
+      'font:12px/1.3 monospace;white-space:pre-wrap;';
+    document.body.appendChild(debugBox);
   }
 
-  const data = await response.json();
+  function log(msg) {
+    var line = new Date().toTimeString().substr(0, 8) + ' ' + msg;
 
-  if (!Array.isArray(data)) {
-    throw new Error('Resposta inválida da API /api/media');
+    if (window.console && console.log) {
+      console.log(line);
+    }
+
+    if (debugBox) {
+      debugLines.push(line);
+      if (debugLines.length > 25) debugLines.shift();
+      debugBox.textContent = debugLines.join('\n');
+    }
   }
 
-  return data;
-}
+  window.onerror = function (message, source, line) {
+    log('[ERRO JS] ' + message + ' (' + source + ':' + line + ')');
+  };
 
-async function loadPlaylist() {
-  try {
-    playlist = await fetchPlaylist();
-    playlistHash = createPlaylistHash(playlist);
+  /* ------------------------------------------------------------------ API */
 
-    if (!playlist.length) {
-      console.warn('Nenhuma mídia encontrada');
-      hidePlayers();
-      return;
-    }
+  function getJSON(url, onSuccess, onError) {
+    var xhr = new XMLHttpRequest();
+    var sep = url.indexOf('?') >= 0 ? '&' : '?';
 
-    currentIndex = 0;
-    showMedia(currentIndex);
-  } catch (error) {
-    console.error('Erro ao carregar mídias:', error);
-    hidePlayers();
+    xhr.open('GET', url + sep + 'ts=' + Date.now(), true);
+    xhr.timeout = 15000;
+
+    xhr.onload = function () {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        onError(new Error('HTTP ' + xhr.status));
+        return;
+      }
+
+      try {
+        onSuccess(JSON.parse(xhr.responseText));
+      } catch (e) {
+        onError(e);
+      }
+    };
+
+    xhr.onerror = function () { onError(new Error('falha de rede')); };
+    xhr.ontimeout = function () { onError(new Error('timeout')); };
+
+    xhr.send();
   }
-}
 
-async function refreshPlaylist(forceReloadCurrent = false) {
-  try {
-    const newPlaylist = await fetchPlaylist();
-    const newHash = createPlaylistHash(newPlaylist);
+  function createPlaylistHash(items) {
+    var parts = [];
 
-    if (newHash === playlistHash) {
-      return;
+    for (var i = 0; i < items.length; i++) {
+      parts.push(items[i].name + '|' + items[i].src + '|' + items[i].size);
     }
 
-    const currentItemName = playlist[currentIndex]?.name;
+    return parts.join(';');
+  }
 
-    playlist = newPlaylist;
-    playlistHash = newHash;
-
-    if (!playlist.length) {
-      console.warn('Playlist vazia após atualização');
-      currentIndex = 0;
-      hidePlayers();
-      return;
+  function findIndexByName(items, name) {
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].name === name) return i;
     }
+    return -1;
+  }
 
-    const sameItemIndex = playlist.findIndex(
-      (item) => item.name === currentItemName
-    );
+  function refreshPlaylist() {
+    getJSON('/api/media', function (data) {
+      if (!data || typeof data.length !== 'number') {
+        log('[PLAYLIST] resposta inválida da API');
+        return;
+      }
 
-    currentIndex = sameItemIndex >= 0 ? sameItemIndex : 0;
+      var newHash = createPlaylistHash(data);
 
-    console.log('Playlist atualizada automaticamente');
+      if (newHash === playlistHash) return;
 
-    preloadNextMedia();
+      var currentItem = playlist[currentIndex];
+      var wasEmpty = playlist.length === 0;
 
-    if (forceReloadCurrent || sameItemIndex < 0) {
+      playlist = data;
+      playlistHash = newHash;
+
+      log('[PLAYLIST] ' + playlist.length + ' mídia(s)');
+
+      if (!playlist.length) {
+        currentIndex = 0;
+        hidePlayers();
+        return;
+      }
+
+      var sameIndex = currentItem ? findIndexByName(playlist, currentItem.name) : -1;
+
+      // O item atual continua na lista e não mudou: segue tocando, só ajusta o índice.
+      if (!wasEmpty && sameIndex >= 0 && playlist[sameIndex].src === currentItem.src) {
+        currentIndex = sameIndex;
+        preloadNextImage();
+        return;
+      }
+
+      // Primeira carga, ou o item atual foi removido/substituído: (re)começa.
+      currentIndex = sameIndex >= 0 ? sameIndex : 0;
       showMedia(currentIndex);
+    }, function (err) {
+      log('[PLAYLIST] erro: ' + err.message);
+    });
+  }
+
+  /* ------------------------------------------------------------------ player */
+
+  function clearTimers() {
+    clearTimeout(imageTimeout);
+    clearTimeout(skipTimeout);
+    imageTimeout = null;
+    skipTimeout = null;
+  }
+
+  function showMedia(index) {
+    clearTimers();
+
+    var item = playlist[index];
+
+    if (!item) return;
+
+    if (item.type === 'video') {
+      showVideo(item);
+    } else {
+      showImage(item);
     }
-  } catch (error) {
-    console.error('Erro ao atualizar playlist:', error);
-  }
-}
 
-function createPlaylistHash(items) {
-  return JSON.stringify(
-    items.map((item) => {
-      return `${item.name}|${item.type}|${item.src}|${item.modifiedAt}|${item.size}`;
-    })
-  );
-}
-
-function showMedia(index) {
-  clearTimeout(imageTimeout);
-
-  const item = playlist[index];
-
-  if (!item) {
-    console.warn('Mídia não encontrada');
-    return;
+    preloadNextImage();
   }
 
-  if (item.type === 'video') {
-    showVideo(item);
-  } else {
-    showImage(item);
+  function showVideo(item) {
+    imageViewer.style.display = 'none';
+    imageViewer.removeAttribute('src');
+
+    videoPlayer.style.display = 'block';
+    videoPlayer.muted = true;
+    videoPlayer.volume = 0;
+
+    if (currentSrc !== item.src) {
+      currentSrc = item.src;
+      videoPlayer.src = item.src;
+      videoPlayer.load();
+    } else {
+      // Mesmo vídeo de novo (ex.: playlist com um vídeo só): volta para o início.
+      try { videoPlayer.currentTime = 0; } catch (e) { /* ignora */ }
+    }
+
+    lastVideoTime = -1;
+    lastProgressAt = Date.now();
+
+    log('[VIDEO] ' + item.name);
+    tryPlay(item);
   }
 
-  preloadNextMedia();
-}
+  function tryPlay(item) {
+    var p;
 
-function showVideo(item) {
-  clearTimeout(imageTimeout);
+    try {
+      p = videoPlayer.play();
+    } catch (e) {
+      log('[VIDEO] play() falhou: ' + e.message);
+      return;
+    }
 
-  imageViewer.style.display = 'none';
-  imageViewer.removeAttribute('src');
-
-  videoPlayer.style.display = 'block';
-
-  videoPlayer.muted = true;
-  videoPlayer.volume = 0;
-  videoPlayer.autoplay = true;
-  videoPlayer.playsInline = true;
-  videoPlayer.preload = 'auto';
-
-  if (videoPlayer.src !== new URL(item.src, window.location.origin).href) {
-    videoPlayer.src = item.src;
-  }
-
-  const playPromise = videoPlayer.play();
-
-  if (playPromise !== undefined) {
-    playPromise
-      .then(() => {
-        console.log(`[VIDEO] Reproduzindo automaticamente: ${item.name}`);
-      })
-      .catch((error) => {
-        console.warn(`[VIDEO] Falha no autoplay: ${item.name}`, error);
-
-        setTimeout(() => {
-          videoPlayer
-            .play()
-            .catch(() => {
-              setTimeout(nextMedia, ERROR_SKIP_DELAY);
-            });
+    // Navegadores antigos não devolvem Promise; o watchdog cobre esse caso.
+    if (p && typeof p.then === 'function') {
+      p.then(null, function (err) {
+        log('[VIDEO] autoplay recusado (' + item.name + '): ' + (err && err.name));
+        // Uma nova tentativa; se não andar, o watchdog pula.
+        setTimeout(function () {
+          if (currentSrc === item.src) {
+            var p2 = videoPlayer.play();
+            if (p2 && typeof p2.then === 'function') p2.then(null, function () {});
+          }
         }, 1000);
       });
+    }
   }
-}
 
-function showImage(item) {
-  clearTimeout(imageTimeout);
+  function showImage(item) {
+    stopVideo();
 
-  videoPlayer.pause();
-  videoPlayer.removeAttribute('src');
-  videoPlayer.style.display = 'none';
+    imageViewer.style.display = 'block';
+    imageViewer.src = item.src;
 
-  imageViewer.style.display = 'block';
-  imageViewer.src = item.src;
+    log('[IMAGEM] ' + item.name);
 
-  imageTimeout = setTimeout(() => {
+    imageTimeout = setTimeout(nextMedia, IMAGE_DURATION);
+  }
+
+  function stopVideo() {
+    try { videoPlayer.pause(); } catch (e) { /* ignora */ }
+
+    if (currentSrc) {
+      videoPlayer.removeAttribute('src');
+      // Libera o decodificador de hardware da TV.
+      try { videoPlayer.load(); } catch (e) { /* ignora */ }
+      currentSrc = '';
+    }
+
+    videoPlayer.style.display = 'none';
+  }
+
+  function hidePlayers() {
+    clearTimers();
+    stopVideo();
+    imageViewer.removeAttribute('src');
+    imageViewer.style.display = 'none';
+  }
+
+  function nextMedia() {
+    if (!playlist.length) return;
+
+    currentIndex = (currentIndex + 1) % playlist.length;
+    showMedia(currentIndex);
+  }
+
+  // Um único pulo agendado por vez (erro + watchdog não pulam duas mídias).
+  function scheduleSkip(reason) {
+    if (skipTimeout) return;
+
+    log('[SKIP] ' + reason);
+    skipTimeout = setTimeout(function () {
+      skipTimeout = null;
+      nextMedia();
+    }, ERROR_SKIP_DELAY);
+  }
+
+  /*
+    Só pré-carrega imagem. Vídeo NÃO: um segundo <video> carregando
+    disputa o decodificador de hardware da TV com o vídeo que está tocando.
+    O cache do servidor/IIS já deixa a troca de vídeo rápida.
+  */
+  function preloadNextImage() {
+    if (playlist.length < 2) return;
+
+    var next = playlist[(currentIndex + 1) % playlist.length];
+
+    if (next && next.type === 'image') {
+      var img = new Image();
+      img.src = next.src;
+    }
+  }
+
+  /* ------------------------------------------------------------------ eventos do vídeo */
+
+  videoPlayer.addEventListener('ended', function () {
     nextMedia();
-  }, IMAGE_DURATION);
-}
+  });
 
-function hidePlayers() {
-  clearTimeout(imageTimeout);
+  videoPlayer.addEventListener('error', function () {
+    if (!currentSrc) return; // erro de quando o src foi removido
 
-  videoPlayer.pause();
-  videoPlayer.removeAttribute('src');
-  videoPlayer.style.display = 'none';
+    var err = videoPlayer.error;
+    var codes = { 1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED' };
 
-  imageViewer.removeAttribute('src');
-  imageViewer.style.display = 'none';
+    scheduleSkip('erro no vídeo: ' + (err ? (codes[err.code] || err.code) : '?') +
+      (err && err.code >= 3 ? ' (provável codec não suportado pela TV)' : ''));
+  });
 
-  if (nextVideoPreload) {
-    nextVideoPreload.removeAttribute('src');
-    nextVideoPreload = null;
-  }
-}
+  videoPlayer.addEventListener('playing', function () {
+    lastProgressAt = Date.now();
+  });
 
-function nextMedia() {
-  if (!playlist.length) return;
+  imageViewer.addEventListener('error', function () {
+    if (imageViewer.getAttribute('src')) {
+      scheduleSkip('erro na imagem: ' + imageViewer.getAttribute('src'));
+    }
+  });
 
-  currentIndex = (currentIndex + 1) % playlist.length;
+  // Watchdog: vídeo que travou ou nunca começou é pulado.
+  setInterval(function () {
+    if (!currentSrc || skipTimeout) return;
 
-  showMedia(currentIndex);
-}
+    var t = videoPlayer.currentTime;
 
-function preloadNextMedia() {
-  if (!playlist.length) return;
+    if (t !== lastVideoTime) {
+      lastVideoTime = t;
+      lastProgressAt = Date.now();
+      return;
+    }
 
-  const nextIndex = (currentIndex + 1) % playlist.length;
-  const nextItem = playlist[nextIndex];
+    if (Date.now() - lastProgressAt > STALL_TIMEOUT) {
+      scheduleSkip('vídeo parado há ' + Math.round(STALL_TIMEOUT / 1000) + 's (readyState=' +
+        videoPlayer.readyState + ', networkState=' + videoPlayer.networkState + ')');
+    }
+  }, WATCHDOG_INTERVAL);
 
-  if (!nextItem) return;
+  /* ------------------------------------------------------------------ atualização automática */
 
-  if (nextItem.type === 'video') {
-    preloadVideo(nextItem);
-    return;
-  }
+  function startMediaEvents() {
+    if (!window.EventSource) {
+      log('[SSE] não suportado; usando só o intervalo');
+      return;
+    }
 
-  preloadImage(nextItem);
-}
+    var es = new EventSource('/api/media/events');
 
-function preloadVideo(item) {
-  if (nextVideoPreload) {
-    nextVideoPreload.pause();
-    nextVideoPreload.removeAttribute('src');
-    nextVideoPreload = null;
-  }
+    es.onmessage = function (event) {
+      var data;
 
-  nextVideoPreload = document.createElement('video');
-
-  nextVideoPreload.preload = 'auto';
-  nextVideoPreload.muted = true;
-  nextVideoPreload.playsInline = true;
-  nextVideoPreload.src = item.src;
-
-  nextVideoPreload.load();
-
-  nextVideoPreload.addEventListener(
-    'canplay',
-    () => {
-      console.log(`[PRELOAD] Próximo vídeo preparado: ${item.name}`);
-    },
-    { once: true }
-  );
-}
-
-function preloadImage(item) {
-  const img = new Image();
-
-  img.src = item.src;
-
-  img.onload = () => {
-    console.log(`[PRELOAD] Próxima imagem preparada: ${item.name}`);
-  };
-}
-
-function startMediaEvents() {
-  if (!window.EventSource) {
-    console.warn('EventSource não suportado neste navegador.');
-    return;
-  }
-
-  eventSource = new EventSource('/api/media/events');
-
-  eventSource.onopen = () => {
-    console.log('Monitoramento de mídia conectado.');
-  };
-
-  eventSource.onmessage = async (event) => {
-    try {
-      const data = JSON.parse(event.data);
+      try { data = JSON.parse(event.data); } catch (e) { return; }
 
       if (data.type === 'MEDIA_UPDATED') {
-        console.log('Alteração detectada na pasta de mídia.');
-
-        await refreshPlaylist(false);
+        log('[SSE] pasta de mídia alterada');
+        refreshPlaylist();
       }
-    } catch (error) {
-      console.error('Erro ao processar evento de mídia:', error);
-    }
-  };
+    };
 
-  eventSource.onerror = () => {
-    console.warn(
-      'Conexão de eventos perdida. O fallback por intervalo continuará ativo.'
-    );
-  };
-}
+    es.onerror = function () {
+      // O EventSource reconecta sozinho; o intervalo continua como fallback.
+    };
+  }
 
-videoPlayer.addEventListener('ended', nextMedia);
+  /* ------------------------------------------------------------------ início */
 
-videoPlayer.addEventListener('error', () => {
-  console.error('Erro ao carregar vídeo:', videoPlayer.error);
+  function start() {
+    log('[INIT] ' + navigator.userAgent);
 
-  setTimeout(nextMedia, ERROR_SKIP_DELAY);
-});
+    refreshPlaylist();
+    startMediaEvents();
+    setInterval(refreshPlaylist, REFRESH_INTERVAL);
+  }
 
-imageViewer.addEventListener('error', () => {
-  console.error('Erro ao carregar imagem:', imageViewer.src);
-
-  setTimeout(nextMedia, ERROR_SKIP_DELAY);
-});
-
-document.addEventListener('DOMContentLoaded', () => {
-  loadPlaylist();
-
-  startMediaEvents();
-
-  setInterval(() => {
-    refreshPlaylist(false);
-  }, REFRESH_INTERVAL);
-});
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+})();

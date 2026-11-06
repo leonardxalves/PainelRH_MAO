@@ -5,6 +5,8 @@ const path = require('path');
 const app = express();
 
 const PORT = process.env.PORT || 8000;
+// Atrás do IIS, use HOST=127.0.0.1 para o Node não ficar exposto na rede.
+const HOST = process.env.HOST || '0.0.0.0';
 
 const publicPath = path.join(__dirname, 'public');
 const mediaFolderName = 'videos_mao';
@@ -25,6 +27,24 @@ function getContentType(filePath) {
   };
 
   return types[ext] || 'application/octet-stream';
+}
+
+function pipeFile(res, filePath, options) {
+  const stream = fs.createReadStream(filePath, options);
+
+  stream.on('error', (error) => {
+    console.error('[MEDIA] Erro no stream:', error);
+    if (!res.headersSent) {
+      res.status(500).end();
+    } else {
+      res.destroy();
+    }
+  });
+
+  // A TV cancela muitos pedidos no meio; sem isso o arquivo fica aberto.
+  res.on('close', () => stream.destroy());
+
+  return stream.pipe(res);
 }
 
 /*
@@ -56,7 +76,9 @@ app.get('/media/:filename', (req, res) => {
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    // A URL já leva ?v=<mtime>: arquivo trocado = URL nova. Com no-store a TV
+    // baixava o vídeo inteiro de novo a cada volta da playlist.
+    res.setHeader('Cache-Control', 'public, max-age=604800');
 
     const isVideo =
       contentType === 'video/mp4' ||
@@ -71,7 +93,7 @@ app.get('/media/:filename', (req, res) => {
     if (!isVideo) {
       res.setHeader('Content-Length', fileSize);
 
-      return fs.createReadStream(filePath).pipe(res);
+      return pipeFile(res, filePath);
     }
 
     /*
@@ -87,31 +109,35 @@ app.get('/media/:filename', (req, res) => {
 
       res.setHeader('Content-Length', fileSize);
 
-      return fs.createReadStream(filePath).pipe(res);
+      return pipeFile(res, filePath);
     }
 
-    const match = range.match(/bytes=(\d*)-(\d*)/);
+    // Só o primeiro intervalo (multi-range não é usado por players de vídeo).
+    const match = range.match(/^bytes=(\d*)-(\d*)/);
 
-    if (!match) {
+    if (!match || (match[1] === '' && match[2] === '')) {
       res.status(416);
       res.setHeader('Content-Range', `bytes */${fileSize}`);
       return res.end();
     }
 
-    let start = match[1] ? parseInt(match[1], 10) : 0;
-    let end = match[2]
-      ? parseInt(match[2], 10)
-      : fileSize - 1;
+    let start;
+    let end;
 
-    if (Number.isNaN(start)) {
-      start = 0;
-    }
-
-    if (Number.isNaN(end)) {
+    if (match[1] === '') {
+      // Sufixo "bytes=-N" = últimos N bytes (TVs usam para ler o moov no fim do MP4).
+      const suffix = parseInt(match[2], 10);
+      start = Math.max(fileSize - suffix, 0);
       end = fileSize - 1;
+    } else {
+      start = parseInt(match[1], 10);
+      // Fim além do tamanho é válido pela RFC 7233: ajusta para o último byte.
+      end = match[2] === ''
+        ? fileSize - 1
+        : Math.min(parseInt(match[2], 10), fileSize - 1);
     }
 
-    if (start >= fileSize || end >= fileSize || start > end) {
+    if (start >= fileSize || start > end) {
       res.status(416);
       res.setHeader('Content-Range', `bytes */${fileSize}`);
       return res.end();
@@ -132,22 +158,7 @@ app.get('/media/:filename', (req, res) => {
       `[VIDEO] ${filename} | Range ${start}-${end}/${fileSize}`
     );
 
-    const stream = fs.createReadStream(filePath, {
-      start,
-      end
-    });
-
-    stream.on('error', (error) => {
-      console.error('[VIDEO] Erro no stream:', error);
-
-      if (!res.headersSent) {
-        res.status(500).end();
-      } else {
-        res.destroy();
-      }
-    });
-
-    return stream.pipe(res);
+    return pipeFile(res, filePath, { start, end });
   } catch (error) {
     console.error('[MEDIA] Erro:', error);
 
@@ -275,11 +286,15 @@ app.get('/api/media/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
 
-  res.flushHeaders?.();
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
 
+  // retry: o navegador reconecta em 5 s se a conexão cair (ex.: timeout do proxy).
   res.write(
-    `data: ${JSON.stringify({
+    `retry: 5000\ndata: ${JSON.stringify({
       type: 'CONNECTED'
     })}\n\n`
   );
@@ -300,9 +315,25 @@ function notifyClients() {
   });
 
   clients.forEach((client) => {
-    client.write(`data: ${payload}\n\n`);
+    try {
+      client.write(`data: ${payload}\n\n`);
+    } catch (error) {
+      console.error('[SSE] Falha ao notificar cliente:', error.message);
+    }
   });
 }
+
+// Comentário a cada 25 s: mantém a conexão viva em proxies (IIS/ARR) e
+// derruba clientes mortos (a TV desligada não avisa que saiu).
+setInterval(() => {
+  clients.forEach((client) => {
+    try {
+      client.write(': ping\n\n');
+    } catch {
+      // o 'close' remove o cliente
+    }
+  });
+}, 25000);
 
 /*
 |--------------------------------------------------------------------------
@@ -361,7 +392,7 @@ app.get('/health', (req, res) => {
 |--------------------------------------------------------------------------
 */
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, HOST, () => {
   console.log('====================================');
 
   console.log('Painel RH rodando em:');
